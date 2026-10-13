@@ -59,14 +59,24 @@ static std::string NormKey(const char* s) {
   return k;
 }
 
-uint32_t StringIndex::Intern(const char* s, bool add) {  // sub_1419DB190
+uint32_t StringIndex::Intern(const char* s, bool add) {  // sub_1419DB190 (91923)
+  // Ground truth (IDA db 2b648d1dca70, sub_1419DB190): the insert-or-find
+  // decides first, and on an existing key with a3==0 the function prints
+  // "Duplicate string index '%s'", returns a FRESH id from the counter, and
+  // NEVER rewrites the node's stored value - the map keeps the FIRST
+  // insertion (only the index->name table gets the fresh entry).  Rewriting
+  // map_[k] here resolved lookups to the LAST duplicate instead: a cubemain
+  // output 'Azurewrath,uni' (rows 29/302) stored 302 rather than 29+1.
   if (!s) s = "";
   std::string k = NormKey(s);
   auto it = map_.find(k);
   if (it != map_.end()) {
     if (add) return it->second;
     std::fprintf(stderr, "Duplicate string index '%s'\n", s);
-    // original falls through and appends a fresh entry
+    uint32_t idx = next_id_++;
+    if (by_index_.size() <= idx) by_index_.resize(idx + 1);
+    by_index_[idx] = s;
+    return idx;
   }
   uint32_t idx = next_id_++;
   map_[k] = idx;

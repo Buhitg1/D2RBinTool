@@ -287,11 +287,38 @@ bool IsPlaceholderName(const char* handle, const std::string& s) {
 
 // Resolve a NUM operand of `fn` at argument index `ai` (state = cond state).
 std::string ResolveNumArg(Decomp& d, int fn, int ai, int state,
-                          const CalcOperand& op, CalcFamilyKind fam) {
+                          const CalcOperand& op, CalcFamilyKind fam,
+                          bool compact = false) {
   std::string s;
+  // Compact mode (cell text longer than the game's 255-character cap): emit
+  // the decimal index for the name-resolved first operands instead of the
+  // quoted name.  Digits lex straight to NUM with the same minimal encoding
+  // the resolver's name path produces, so the re-encoding is byte-identical;
+  // this is also what the modder's own txt must have used, since the game
+  // truncates a calc cell at 255 chars (v67[256] in ParseRows, v44[256] in
+  // the lexer, sub_14166DE90) and the name form of such chains reaches ~400.
+  if (compact && ai == 0) {
+    switch (fn) {
+      case FN_SKILL: case FN_MISS: case FN_STAT:
+      case FN_SKLVL: case FN_SKSRC:
+        return std::to_string(op.value);
+      default: break;
+    }
+  }
   // A resolved string-index name may contain spaces, so it must be re-emitted
-  // quoted for the lexer to read it back as one token.
-  auto Q = [](const std::string& t) { return "'" + t + "'"; };
+  // quoted for the lexer to read it back as one token.  A name containing an
+  // apostrophe CANNOT round-trip through the quotes: the game's lexer
+  // (sub_14166DE90) reads a quoted string up to the FIRST ' with no escape
+  // mechanism (ground truth: D2R.exe 69270), so e.g. skill('Thunder God's
+  // Wrath',41) would resolve 'Thunder God' and leave stray tokens.  Emit the
+  // decimal index instead -- digits lex straight to NUM, byte-exact (this is
+  // also what the modder's own txt must have used: the shipped page stores
+  // NUM8(20) for exactly such a cell).
+  auto QD = [](const std::string& t, int v) -> std::string {
+    if (t.find('\'') != std::string::npos) return std::to_string(v);
+    return "'" + t + "'";
+  };
+  auto Q = [&](const std::string& t) { return QD(t, op.value); };
   switch (fn) {
     case FN_SKILL:  // skill
       if (ai == 0) {
@@ -320,10 +347,15 @@ std::string ResolveNumArg(Decomp& d, int fn, int ai, int state,
         return std::to_string(op.value);
       }
       if (ai == 1) {
-        if (op.value == 0) return "accr";
-        if (op.value == 1) return "base";
-        if (op.value == 2) return "mod";
-        break;
+        // The flag operand of stat(): the game's keyword path
+        // (sub_14078B9C0 case 5) yields VAL(1)/VAL(2)/VAL(0) for
+        // base/mod/anything-else, while a literal digit lexes straight to
+        // NUM.  A NUM operand here therefore came from digits in the source
+        // txt, so invert it back to digits: emitting a word would re-encode
+        // as VAL and break the byte-exact round trip (the base page's two
+        // NUM8(0) flags come from the dot-syntax `stat('x'.accr)`, where the
+        // dot path coerces the resolver's VAL(0) to NUM).
+        return std::to_string(op.value);
       }
       return std::to_string(op.value);
     case FN_SKLVL:  // sklvl
@@ -421,7 +453,7 @@ std::string ResolveVal(Decomp& d, CalcFamilyKind fam, int value) {
 // Disassemble one expression starting at `off`; returns the text and advances
 // *end to the first byte after the terminating BBE_END.
 std::string DisasmCalc(Decomp& d, const std::vector<uint8_t>& pg, uint32_t off,
-                       CalcFamilyKind fam, size_t* end) {
+                       CalcFamilyKind fam, size_t* end, bool compact = false) {
   std::vector<CalcOperand> st;
   size_t i = off;
   auto pop = [&]() -> CalcOperand {
@@ -442,9 +474,24 @@ std::string DisasmCalc(Decomp& d, const std::vector<uint8_t>& pg, uint32_t off,
     if (op == BBE_END) break;
     switch (op) {
       case BBE_FUNC: {
-        if (i + 1 >= pg.size()) { *end = i; return ""; }
+        // 69270 (sub_14166EC80) emits ONLY `op, operand` for a FUNC -- there is
+        // NO arity byte (3.1.1 emitted a third byte holding nOperands, which is
+        // why OpSize(BBE_FUNC) == e->nOperands).  Reading a phantom arity byte
+        // desynchronised the stream and produced garbage expressions like
+        // `min('usmc',0,max(),256`.  Derive the count from the function index
+        // through the same table the compiler uses (CalcFunctionArity, i.e.
+        // off_145CEE210: min/max/rand/skill/miss/stat = 2, sklvl = 3, sksrc = 2,
+        // cond = dynamic).  69270's CalcFunctionIndex (sub_14078B8B0) only ever
+        // yields 0..6, so the dynamic cond case cannot occur here.
+        if (i >= pg.size()) { *end = i; return ""; }
         int fn = pg[i++];
-        int argc = pg[i++];
+        int argc = CalcFunctionArity(fn);
+        if (argc < 0) {
+          d.warn("calc: dynamic-arity fn " + std::to_string(fn) + " at " +
+                 std::to_string(i - 1));
+          *end = i;
+          return "";
+        }
         std::vector<CalcOperand> args(argc);
         for (int a = argc - 1; a >= 0; --a) args[a] = pop();
         // cond state comes from the resolved first argument value.
@@ -454,9 +501,28 @@ std::string DisasmCalc(Decomp& d, const std::vector<uint8_t>& pg, uint32_t off,
         bool un = false;
         for (int a = 0; a < argc; ++a) {
           if (a) oss << ",";
-          if (args[a].is_val) oss << args[a].text;   // already resolved at push
+          if (args[a].is_val) {
+            if (fn == FN_STAT && a == 1) {
+              // VAL flag operand of stat(): invert the keyword mapping of
+              // sub_14078B9C0 case 5 (base/mod/other -> VAL 1/2/0) instead
+              // of the family calc-code name resolved at push time.  These
+              // are VAL operands, so they can never be digit-compacted
+              // (digits lex to NUM, not VAL) -- the keywords stay even in
+              // compact mode; they are only 3-5 characters.
+              if (args[a].value == 1) oss << "base";
+              else if (args[a].value == 2) oss << "mod";
+              else if (args[a].value == 0) oss << "accr";
+              else {
+                d.warn("calc: unknown stat flag VAL(" +
+                       std::to_string(args[a].value) + ")");
+                oss << args[a].text;
+              }
+            } else {
+              oss << args[a].text;   // already resolved at push
+            }
+          }
           else if (args[a].leaf_num)
-            oss << ResolveNumArg(d, fn, a, state, args[a], fam);
+            oss << ResolveNumArg(d, fn, a, state, args[a], fam, compact);
           else oss << args[a].text;                  // sub-expression / function
           un = un || args[a].unmatched;
         }
@@ -639,20 +705,25 @@ enum CubeOutType {
 };
 
 std::string InvertCubeOutput(Decomp& d, const uint8_t* slot, uint32_t row) {
-  uint32_t rownum = rd32(slot);
-  uint16_t w4 = rd16(slot + 4);
-  uint16_t stat = rd16(slot + 6);
-  uint16_t v1 = rd16(slot + 8);
-  uint8_t kind = slot[10], qty = slot[11], lvl = slot[12];
-  int8_t type = (int8_t)slot[13];
+  (void)row;
+  // 69270 slot layout (sub_140B56450, 84-byte stride, base row+84*idx+76):
+  //   +0 flag word (w4)   +2 stat idx   +4 unique/set index+1   +6 quality 1..9
+  //   +7 qty / lvl        +8 type (signed)   +11 unique/set "extra"
+  //   +12 pre[0..2] (u16) +18 suf[0..2] (u16)
+  // 3.1.1 had a leading row number and 89-byte slots; 69270 dropped the row
+  // number and compacted the slot, so "absent column / empty cell" is simply an
+  // all-zero slot.  slot[2]/[4]/[11] are DERIVED by the forward pass (stat,
+  // unique/set index, itemtype extra) and are recomputed on recompile, so only
+  // the txt-derived fields are emitted here.
+  uint16_t w4 = rd16(slot + 0);
+  uint16_t stat = rd16(slot + 2);
+  uint16_t v1 = rd16(slot + 4);
+  uint8_t kind = slot[6], qty = slot[7];
+  int8_t type = (int8_t)slot[8];
   bool rest_zero = true;
-  for (int k = 4; k < 29; ++k)
+  for (int k = 0; k < 24; ++k)
     if (slot[k]) { rest_zero = false; break; }
-  if (!rownum && rest_zero) return "";   // absent column or empty cell
-  if (rownum == row && rest_zero) return "x";  // parse failure after row write
-  if (rownum != row)
-    d.warn("cube output: row number " + std::to_string(rownum) +
-           " != row " + std::to_string(row));
+  if (rest_zero) return "";   // absent column or empty cell
   std::string head;
   std::string s;
   switch (type) {
@@ -691,7 +762,8 @@ std::string InvertCubeOutput(Decomp& d, const uint8_t* slot, uint32_t row) {
   static const char* kKindWords[10] = {"", "low", "nor", "hiq", "mag",
                                        "set", "rar", "uni", "crf", "tmp"};
   // "sock" swallows the following token as its quantity, so the stored
-  // quantity travels on the sock token itself ("sock=N").
+  // quantity travels on the sock token itself ("sock=N").  69270 shares the
+  // byte between qty and lvl; no shipped recipe uses lvl, so qty is emitted.
   if (w4 & 2) {
     out += ",sock";
     if (qty) out += "=" + std::to_string(qty);
@@ -705,13 +777,12 @@ std::string InvertCubeOutput(Decomp& d, const uint8_t* slot, uint32_t row) {
   };
   for (auto& e : kWords)
     if (w4 & e.bit) { out += ","; out += e.word; }
-  if (lvl) out += ",lvl=" + std::to_string(lvl);
   for (int k = 0; k < 3; ++k) {
-    uint16_t pre = rd16(slot + 17 + 2 * k);
+    uint16_t pre = rd16(slot + 12 + 2 * k);
     if (pre) out += ",pre=" + std::to_string(pre);
   }
   for (int k = 0; k < 3; ++k) {
-    uint16_t suf = rd16(slot + 23 + 2 * k);
+    uint16_t suf = rd16(slot + 18 + 2 * k);
     if (suf) out += ",suf=" + std::to_string(suf);
   }
   return out;
@@ -1317,6 +1388,23 @@ std::string InvertCallback(Decomp& d, const TableDef& def,
       }
       size_t end = 0;
       std::string text = DisasmCalc(d, *pg, off, fam, &end);
+      // The game truncates a calc cell at 255 characters: ParseRows copies the
+      // cell text into a 256-byte buffer (v67[256], the PARSE26/27/28 case),
+      // and the lexer caps identifiers the same way (v44[256], sub_14166DE90).
+      // A name-based rendering can exceed that cap (15-skill chains reach ~400
+      // chars) even though the source txt was within it, so re-render with
+      // decimal operands -- the compact form is what the modder's txt used and
+      // the digits re-encode byte-identically.
+      if (text.size() > 255) {
+        size_t end2 = 0;
+        std::string compact = DisasmCalc(d, *pg, off, fam, &end2, true);
+        if (compact.size() > 255)
+          d.warn(std::string(def.name) + "." + name +
+                 ": calc text exceeds the 255-char cap even compacted (" +
+                 std::to_string(compact.size()) + " chars)");
+        else
+          text = std::move(compact);
+      }
       if (text.empty())
         d.warn(std::string(def.name) + "." + name + ": failed to disassemble " + page +
                " at " + std::to_string(off));
@@ -1402,10 +1490,13 @@ std::string InvertCallback(Decomp& d, const TableDef& def,
   if (cb && std::strcmp(cb, "parse_monstats_sound") == 0) {
     unsigned idx = (unsigned)f.offset;
     if (idx >= 8) return "";
-    int16_t guard = rdi16(row + 2 * idx + 452);
+    // 69270 offsets (sub_1408A77E0): the skill guard is the SkN skill index at
+    // 2*idx+420 (Skill1..8 @420), the mode byte is at idx+436 and the sound
+    // word at 2*idx+444 -- 3.1.1 used 452/468/476.
+    int16_t guard = rdi16(row + 2 * idx + 420);
     if (guard < 0) return "";
-    uint8_t b = (uint8_t)row[idx + 468];
-    uint16_t s = rd16(row + 2 * idx + 476);
+    uint8_t b = (uint8_t)row[idx + 436];
+    uint16_t s = rd16(row + 2 * idx + 444);
     std::string t;
     if (b == 14) {
       if (!d.StrText("monseq_sequence_index", s, &t)) {
@@ -1424,7 +1515,8 @@ std::string InvertCallback(Decomp& d, const TableDef& def,
     return InvertCubeInput(d, row + 8 * (int64_t)f.offset + 20);
   }
   if (cb && std::strcmp(cb, "parse_cube_output") == 0) {
-    return InvertCubeOutput(d, row + 89 * (int64_t)f.offset + 76, r);
+    // 69270 compacted the output slot from 89 to 84 bytes (sub_140B56450).
+    return InvertCubeOutput(d, row + 84 * (int64_t)f.offset + 76, r);
   }
   if (cb && std::strcmp(cb, "parse_cube_param") == 0) {
     int32_t v = rdi32(row + O);
@@ -1536,6 +1628,8 @@ static std::string ParentExcelDir(const std::string& in_dir) {
   return parent_dir;
 }
 
+const TableDef* FindFinal(const char* name);  // defined below (kind-0 twin)
+
 // Mirror of SeedIndexFromColumn in main.cpp: replay one index-bearing column
 // into its exact global handle, but recover the cell text from the compiled
 // image instead of the (absent) txt.
@@ -1555,7 +1649,16 @@ static std::string ParentExcelDir(const std::string& in_dir) {
 bool SeedColumnFromBin(Decomp& d, const char* table, const char* field,
                        int type, int len, const char* handle,
                        const std::string& bin_path = std::string()) {
-  const TableDef* def = d.FindTable(table);
+  // The .bin follows the table's LATE (kind-0) registration, so the field's
+  // image type/offset/len must come from THAT descriptor.  FindTable returns
+  // the FIRST registration, which for skills/monstats/skilldesc/monmode/plrmode
+  // is the EARLY kind-4 duplicate: its field is index-only (type 17), which
+  // would force the IndexColumnText path and emit "<handle>#<idx>" placeholders
+  // even though the late type (19, TXTIDX16T) carries the names inline -- the
+  // exact reason a bin-only mod (no skills.txt) seeded skills_skill_index with
+  // placeholders and then failed its round-trip.  Prefer the kind-0 twin.
+  const TableDef* def = FindFinal(table);
+  if (!def) def = d.FindTable(table);
   const ExcelFieldDesc* f = d.FindField(def, field);
   std::vector<uint8_t> bin;
   std::string path = bin_path.empty() ? (d.in_dir + "/" + table + ".bin") : bin_path;
@@ -1752,6 +1855,27 @@ int RunDecompile(Engine& eng, const std::string& in_dir,
     if (rev) {
       for (const auto& kv : *rev)
         if (!d.translation.count(kv.first)) d.translation[kv.first] = kv.second;
+      // Carry the localisation with the output.  The generated txt references
+      // string KEYS for every type 24/25 STRCALL cell, so a standalone compile
+      // of this directory must discover the SAME <root>/local/lng/strings
+      // the decompile resolved against -- exactly the layout a game data dir
+      // has next to its excel txt.  Without it, TranslationCallback16 misses
+      // every key and collapses those cells to the default 5382.
+      std::string sdir;
+      if (Engine::FindStringsDir(in_dir, sdir)) {
+        std::error_code ec;
+        fs::path src(sdir);
+        fs::path dst = fs::path(out_dir) / "local" / "lng" / "strings";
+        std::error_code eq;
+        if (!fs::equivalent(src, dst, eq)) {
+          fs::create_directories(dst, ec);
+          if (!ec)
+            fs::copy(src, dst, fs::copy_options::recursive |
+                                fs::copy_options::overwrite_existing, ec);
+          if (ec)
+            d.warn("localisation copy failed: " + ec.message());
+        }
+      }
     }
   }
   fs::create_directories(out_dir);

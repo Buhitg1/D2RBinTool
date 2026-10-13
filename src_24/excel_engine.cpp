@@ -59,14 +59,33 @@ static std::string NormKey(const char* s) {
   return k;
 }
 
-uint32_t StringIndex::Intern(const char* s, bool add) {  // sub_1419DB190
+uint32_t StringIndex::Intern(const char* s, bool add) {  // sub_14164AA50
+  // The insert path is an insert-or-find (sub_14164C320): when the key is
+  // already present the freshly built node is DISCARDED and the existing
+  // node -- carrying its ORIGINAL index -- is returned.  So the key->index
+  // map always keeps the FIRST insertion, and a duplicate never rewrites it.
+  // The add=false path still consumes a fresh id (the caller stores the name
+  // at that id in the index->name table), it just is not what the name
+  // resolves to.  Verified against shipped cubemain.bin: uniqueitems has
+  // "Crainte Vomir" at rows 119/621/622 and every cube output referencing it
+  // stores index 119 (0x77+1), i.e. first-wins.
   if (!s) s = "";
   std::string k = NormKey(s);
   auto it = map_.find(k);
   if (it != map_.end()) {
     if (add) return it->second;
     std::fprintf(stderr, "Duplicate string index '%s'\n", s);
-    // original falls through and appends a fresh entry
+    // sub_14164AA50 a3==0 duplicate path: the warning prints, then the
+    // function returns a FRESH id from the counter -- but the map node keeps
+    // its ORIGINAL value.  Only the caller stores the name at the fresh id
+    // (index->name), so a lookup still resolves to the FIRST insertion.
+    // Verified against shipped cubemain.bin: uniqueitems has "Crainte Vomir"
+    // at rows 119/621/622 and every cube output referencing it stores 119
+    // (0x77+1).  Rewriting map_[k] here resolved outputs to row 622 instead.
+    uint32_t idx = next_id_++;
+    if (by_index_.size() <= idx) by_index_.resize(idx + 1);
+    by_index_[idx] = s;
+    return idx;
   }
   uint32_t idx = next_id_++;
   map_[k] = idx;
@@ -216,17 +235,24 @@ static void ParseVariations(uint8_t, const char* text, char* row, int offset,
   }
 }
 
-// parse_monstats_sound -> sub_140A905C0: monstats sound code.  Stores a code byte at
-// row+offset+468 and a fallback string index at row+2*offset+476.
+// parse_monstats_sound -> sub_1408A77E0 (D2R.exe 69270; the descriptor points at
+// the thunk sub_140017C7E): monstats skill-mode callback.  Stores a code byte at
+// row + idx + 436 and a fallback sequence index at row + 2*idx + 444; it skips
+// the row entirely when the paired SkillN index at row + 2*idx + 420 is negative.
+// NOTE: these three record offsets are HARDCODED in the game and DIFFER between
+// builds -- 3.1.1 uses 468 / 476 / 452 because its monstats record places SkillN
+// at 452, whereas 69270 places SkillN at 420 (so mode=436, seq=444).  Using the
+// 3.1.1 constants here writes past the 476-byte record and corrupts the next
+// row's Id index, which is exactly the shipped-bytes failure this fixes.
 static void ParseMonStatsSound(uint8_t, const char* text, char* row, int offset,
                                int, int, int) {
   if (!row) return;
   unsigned idx = (unsigned)offset;
   if (idx >= 8) return;
   if (!g_engine) return;
-  row[idx + 468] = 0;
-  *(uint16_t*)(row + 2 * idx + 476) = 0xFFFF;
-  if (*(int16_t*)(row + 2 * idx + 452) < 0) return;
+  row[idx + 436] = 0;
+  *(uint16_t*)(row + 2 * idx + 444) = 0xFFFF;
+  if (*(int16_t*)(row + 2 * idx + 420) < 0) return;
   if (!text) return;
   DataIndex* code = g_engine->GetIndex("monmode_code_index");
   uint8_t v = 0xFF;
@@ -235,12 +261,12 @@ static void ParseMonStatsSound(uint8_t, const char* text, char* row, int offset,
     uint32_t r = code ? code->code.Lookup(c, true) : 0xFFFFFFFFu;
     v = (uint8_t)r;
   }
-  row[idx + 468] = (char)v;
+  row[idx + 436] = (char)v;
   if ((int8_t)v < 0 || v == 14) {
-    row[idx + 468] = 14;
+    row[idx + 436] = 14;
     DataIndex* str = g_engine->GetIndex("monseq_sequence_index");
     uint32_t r = str ? str->str.Lookup(text, true) : 0xFFFFFFFFu;
-    *(uint16_t*)(row + 2 * idx + 476) = (uint16_t)r;
+    *(uint16_t*)(row + 2 * idx + 444) = (uint16_t)r;
   }
 }
 
@@ -429,7 +455,6 @@ static void ParseCubeInput(uint8_t, const char* text, char* row, int offset,
     else if (CubeIEq(m, "exc")) w[0] |= 0x200u;
     else if (CubeIEq(m, "eli")) w[0] |= 0x400u;
     else if (CubeIEq(m, "nru")) w[0] |= 0x800u;
-    else if (CubeIEq(m, "id")) w[0] |= 0x1000u;
     else {
       std::fprintf(stderr,
           "Couldn't parse horardric cube input modifier!  (Line:%d  Item:%d)\n",
@@ -439,13 +464,21 @@ static void ParseCubeInput(uint8_t, const char* text, char* row, int offset,
   }
 }
 
-// sub_140B56ED0 -> sub_140B56450: horadric cube output slot parser.
+// sub_140947860 -> sub_140946EB0: horadric cube output slot parser (D2R.exe
+// 69270).  The output slot is 84 bytes at row + 84*idx + 76 and is COMPACTED
+// relative to 3.1.1 (89 bytes at +89*idx+76 with the flag word at +4): 69270
+// puts the flag word at +0, so every member shifts down by 4, and the
+// uniqueitems/setitems "extra" byte is read at +52/+48 instead of +56/+52.
+// The game stores no line number in the slot (3.1.1 used the 4 bytes the flag
+// word now occupies).
+//   +0  u16 flags      +2  u16 stat      +4  u16 (unique/set index + 1)
+//   +6  u8  quality    +7  u8  qty/lvl   +8  u8  kind
+//   +11 u8  extra      +12 u16 pre[..]   +18 u16 suf[..]
 static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
                             int, int r, int c) {
   if (!row || !text || !*text) return;
-  char* slot = row + 89 * (int64_t)offset + 76;
-  *(uint32_t*)slot = (uint32_t)r;
-  uint16_t* w4 = (uint16_t*)(slot + 4);
+  char* slot = row + 84 * (int64_t)offset + 76;
+  uint16_t* w4 = (uint16_t*)slot;   // flag word at +0
   int found = 0;
 
   char buf[256];
@@ -454,19 +487,18 @@ static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
   char* cur = CubeUnquote(buf);
   char* tok = CubeNext(&cur, ",");
 
-  if (CubeIEq(tok, "Cow Portal")) { slot[13] = 1; found = 1; }
-  else if (CubeIEq(tok, "Pandemonium Portal")) { slot[13] = 2; found = 1; }
-  else if (CubeIEq(tok, "Pandemonium Finale Portal")) { slot[13] = 3; found = 1; }
-  else if (CubeIEq(tok, "Red Portal")) { slot[13] = 4; found = 1; }
-  else if (CubeIEq(tok, "usetype")) { slot[13] = (char)-1; found = 1; }
-  else if (CubeIEq(tok, "reg")) { slot[13] = (char)-1; *w4 |= 0x40u; found = 1; }
-  else if (CubeIEq(tok, "useitem")) { slot[13] = (char)-2; found = 1; }
+  if (CubeIEq(tok, "Cow Portal")) { slot[8] = 1; found = 1; }
+  else if (CubeIEq(tok, "Pandemonium Portal")) { slot[8] = 2; found = 1; }
+  else if (CubeIEq(tok, "Pandemonium Finale Portal")) { slot[8] = 3; found = 1; }
+  else if (CubeIEq(tok, "Red Portal")) { slot[8] = 4; found = 1; }
+  else if (CubeIEq(tok, "usetype")) { slot[8] = (char)-1; found = 1; }
+  else if (CubeIEq(tok, "useitem")) { slot[8] = (char)-2; found = 1; }
 
   uint16_t stat = 0;
   if (!found && std::strlen(tok) <= 4) {
     if (CubeItemStatsByCode(PackCodeU32(tok), &stat)) {
-      slot[13] = (char)-4;
-      *(uint16_t*)(slot + 6) = stat;
+      slot[8] = (char)-4;
+      *(uint16_t*)(slot + 2) = stat;
       found = 1;
     }
   }
@@ -474,8 +506,8 @@ static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
     DataIndex* ix = g_engine->GetIndex("itemtypes_code_index");
     uint32_t v = ix ? ix->code.Lookup(PackCodeU32(tok), false) : 0xFFFFFFFFu;
     if (v != 0xFFFFFFFFu) {
-      slot[13] = (char)-3;
-      *(uint16_t*)(slot + 6) = (uint16_t)v;
+      slot[8] = (char)-3;
+      *(uint16_t*)(slot + 2) = (uint16_t)v;
       found = 1;
     }
   }
@@ -486,12 +518,12 @@ static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
       const uint8_t* e = CubeRow("uniqueitems", v);
       uint16_t st = 0;
       if (e) CubeItemStatsByCode(rd_u32(e + 40), &st);
-      slot[13] = (char)-4;
+      slot[8] = (char)-4;
       *w4 |= 8u;
-      slot[10] = 7;
-      *(uint16_t*)(slot + 8) = (uint16_t)(v + 1);
-      *(uint16_t*)(slot + 6) = st;
-      slot[16] = e ? (char)e[56] : 0;
+      slot[6] = 7;
+      *(uint16_t*)(slot + 4) = (uint16_t)(v + 1);
+      *(uint16_t*)(slot + 2) = st;
+      slot[11] = e ? (char)e[52] : 0;
       found = 1;
     }
   }
@@ -504,12 +536,12 @@ static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
       const uint8_t* e = CubeRow("setitems", v);
       uint16_t st = 0;
       if (e) CubeItemStatsByCode(rd_u32(e + 40), &st);
-      slot[13] = (char)-4;
+      slot[8] = (char)-4;
       *w4 |= 8u;
-      slot[10] = 5;
-      *(uint16_t*)(slot + 8) = (uint16_t)(v + 1);
-      *(uint16_t*)(slot + 6) = st;
-      slot[16] = e ? (char)e[52] : 0;
+      slot[6] = 5;
+      *(uint16_t*)(slot + 4) = (uint16_t)(v + 1);
+      *(uint16_t*)(slot + 2) = st;
+      slot[11] = e ? (char)e[48] : 0;
     }
   }
   if (!found) {
@@ -529,36 +561,36 @@ static void ParseCubeOutput(uint8_t, const char* text, char* row, int offset,
       return;
     }
     if (CubeIEq(m, "qty")) {
-      slot[11] = (char)CubeNextInt(&cur, ",");
+      slot[7] = (char)CubeNextInt(&cur, ",");
     } else if (CubeIEq(m, "pre")) {
-      *(uint16_t*)(slot + 17 + 2 * pre) = (uint16_t)CubeNextInt(&cur, ",");
+      *(uint16_t*)(slot + 12 + 2 * pre) = (uint16_t)CubeNextInt(&cur, ",");
       ++pre;
     } else if (CubeIEq(m, "suf")) {
-      *(uint16_t*)(slot + 23 + 2 * suf) = (uint16_t)CubeNextInt(&cur, ",");
+      *(uint16_t*)(slot + 18 + 2 * suf) = (uint16_t)CubeNextInt(&cur, ",");
       ++suf;
-    } else if (CubeIEq(m, "low")) slot[10] = 1;
-    else if (CubeIEq(m, "nor")) slot[10] = 2;
-    else if (CubeIEq(m, "hiq")) slot[10] = 3;
-    else if (CubeIEq(m, "mag")) slot[10] = 4;
-    else if (CubeIEq(m, "set")) slot[10] = 5;
-    else if (CubeIEq(m, "rar")) slot[10] = 6;
-    else if (CubeIEq(m, "uni")) slot[10] = 7;
-    else if (CubeIEq(m, "crf")) slot[10] = 8;
-    else if (CubeIEq(m, "tmp")) slot[10] = 9;
+    } else if (CubeIEq(m, "low")) slot[6] = 1;
+    else if (CubeIEq(m, "nor")) slot[6] = 2;
+    else if (CubeIEq(m, "hiq")) slot[6] = 3;
+    else if (CubeIEq(m, "mag")) slot[6] = 4;
+    else if (CubeIEq(m, "set")) slot[6] = 5;
+    else if (CubeIEq(m, "rar")) slot[6] = 6;
+    else if (CubeIEq(m, "uni")) slot[6] = 7;
+    else if (CubeIEq(m, "crf")) slot[6] = 8;
+    else if (CubeIEq(m, "tmp")) slot[6] = 9;
     else if (CubeIEq(m, "eth")) *w4 |= 4u;
     else if (CubeIEq(m, "sock")) {
       *w4 |= 2u;
-      slot[11] = (char)CubeNextInt(&cur, ",");
+      slot[7] = (char)CubeNextInt(&cur, ",");
     } else if (CubeIEq(m, "mod")) *w4 |= 1u;
     else if (CubeIEq(m, "uns")) *w4 |= 0x10u;
     else if (CubeIEq(m, "rem")) *w4 |= 0x20u;
-    else if (CubeIEq(m, "reg")) { slot[13] = (char)-1; *w4 |= 0x40u; }
+    else if (CubeIEq(m, "reg")) { slot[8] = (char)-1; *w4 |= 0x40u; }
     else if (CubeIEq(m, "exc")) *w4 |= 0x80u;
     else if (CubeIEq(m, "eli")) *w4 |= 0x100u;
     else if (CubeIEq(m, "rep")) *w4 |= 0x200u;
     else if (CubeIEq(m, "rch")) *w4 |= 0x400u;
     else if (CubeIEq(m, "lvl")) {
-      slot[12] = (char)CubeNextInt(&cur, ",");
+      slot[7] = (char)CubeNextInt(&cur, ",");
     } else {
       std::fprintf(stderr,
           "Couldn't parse horardric cube output modifier '%s'!  (Line:%d  Item:%d)\n",
@@ -1209,7 +1241,7 @@ static bool ReadWholeFile(const std::string& path, std::string& out) {
 // Discover <root>/local/lng/strings relative to the excel input directory.
 // `in_dir` is typically .../global/excel or .../global/excel/base; the
 // localisation lives at <root>/local/lng/strings.
-static bool FindStringsDir(const std::string& in_dir, std::string& out_dir) {
+bool Engine::FindStringsDir(const std::string& in_dir, std::string& out_dir) {
   std::error_code ec;
   std::filesystem::path p = std::filesystem::absolute(in_dir, ec);
   for (int i = 0; i < 8; ++i) {

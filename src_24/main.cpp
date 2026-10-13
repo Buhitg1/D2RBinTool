@@ -197,8 +197,10 @@ int main(int argc, char** argv) {
     Engine eng(3);
     if (!LoadStrings(eng, in_dir)) std::fprintf(stderr, "warning: no localisation strings found\n");
     // Seed indexes consumed before their provider tables' normal kTables
-    // position. Each field type/handle mirrors its registered descriptor, so
-    // the temporary compile inserts names in exact source row order.
+    // position.  Each field type/handle mirrors its registered descriptor, so
+    // the temporary compile inserts names in exact source row order.  The handle
+    // spellings are identical to 3.1.1/3.3 (the 69270 descriptors copy them
+    // verbatim from src/tables.cpp), so no remap is needed.
     std::string seed_err;
     if (!SeedIndexFromColumn(eng, in_dir, "skills", "skill", 19, 31,
                              "skills_skill_index", 33, &seed_err) ||
@@ -233,8 +235,8 @@ int main(int argc, char** argv) {
       return 4;
     }
     // sub_140928A60 pushes five range codes into the skills range code index
-    // (instance+9912) before registering skills: none/h2h/rng/both/loc with
-    // insertion-order values 0..4.
+    // (skills_range_code_index) before registering skills: none/h2h/rng/both/loc
+    // with insertion-order values 0..4.
     {
       DataIndex* ix = eng.GetIndex("skills_range_code_index");
       static const char* kRangeCodes[5] = {"none", "h2h", "rng", "both", "loc"};

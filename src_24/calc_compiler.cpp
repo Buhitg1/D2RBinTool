@@ -224,8 +224,15 @@ uint8_t* Compiler::Emit(uint8_t* cur, uint8_t* base, int max_len, uint8_t newOp,
     ++n_operands_;
     *cur++ = top->op;
     if (top->op == BBE_FUNC) {
+      // 69270 (sub_14166EC80): a FUNC emits ONLY op + operand, with NO size
+      // byte.  The 3.1.1/3.3 compiler emits a third byte (the operand count);
+      // 69270's interpreter recomputes it from the function index at run time
+      // (sub_14166EB90 case 1 calls the arity callback).  Ground truth: this
+      // emit and the ')' handler below both write exactly two bytes for
+      // BBE_FUNC -- verified in D2R.exe 69270 (IDA 2ada4c852339).  Emitting the
+      // size byte here shifts every following byte, which is exactly the
+      // skillscode/misscode/skilldesccode page mismatch this fixes.
       *cur++ = (uint8_t)top->operand;
-      *cur++ = (uint8_t)size;
       top->flag = 1;
       break;
     }
@@ -474,15 +481,24 @@ int Compiler::Resolve(const char* text, uint8_t top_op, int32_t top_operand,
       *out_kind = 1;
       return lookup("missiles_missile_index");
     case FN_STAT:  // stat
-      if (n != 0) {
-        *out_kind = 1;
+      // sub_14078B9C0 case 5 (sub_14078B9C0 receives a3==1 whenever the
+      // operand stack top is the enclosing FUNC, so this path serves EVERY
+      // quoted/bare identifier inside stat(...), first operand and flag
+      // alike): try the itemstatcost name index -> (NUM, idx); on a miss
+      // compare against "base" -> (VAL,1), "mod" -> (VAL,2), and ANY other
+      // identifier -- including "accr" and calc codes like "ln12" ->
+      // (VAL,0).  The original's strcmp("accr") result is discarded; the
+      // shipped mod page proves it with ~180 VAL8(0) flag operands and 7
+      // VAL8(0) stat-index operands (stat('ln12',0): itemstatcost miss,
+      // keyword miss -> VAL(0)).
+      {
+        int v = lookup("itemstatcost_stat_index");
+        if (v >= 0) { *out_kind = 1; return v; }
+        *out_kind = 0;
         if (std::strcmp(text, "base") == 0) return 1;
         if (std::strcmp(text, "mod") == 0) return 2;
-        if (std::strcmp(text, "accr") == 0) return 0;
-        return -1;
+        return 0;
       }
-      *out_kind = 1;
-      return lookup("itemstatcost_stat_index");
     case FN_SKLVL:  // sklvl
       if (n != 0) {
         if (n == 1) {
@@ -604,6 +620,10 @@ int Compiler::Run(const char* text, uint8_t* out, int max_len) {
     uint8_t type = 0;
     int value = 0;
     const char* np = Lex(p, &type, &value);
+    if (std::getenv("D2DT_TRACE") && std::strlen(text) > 350)
+      std::fprintf(stderr, "TRACE np=%d t=%d v=%d p=%d c='%c' ops=%d operands=%d\n",
+                   np ? 1 : 0, (int)type, value, (int)(p - text),
+                   *p ? *p : '?', n_ops_, n_operands_);
     if (np != nullptr) {
       p = np;
       switch (type) {
@@ -679,8 +699,8 @@ int Compiler::Run(const char* text, uint8_t* out, int max_len) {
             n_operands_ -= size;
             ++n_operands_;
             *cur++ = top->op;
+            // 69270: a FUNC is op + operand only (no size byte); see Emit above.
             *cur++ = (uint8_t)top->operand;
-            *cur++ = (uint8_t)size;
             top->flag = 1;
             break;
           }

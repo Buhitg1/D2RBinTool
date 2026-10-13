@@ -160,6 +160,10 @@ class Engine {
   bool LoadStrings(const std::string& in_dir);
   bool LoadStringsFromJsonDir(const std::string& dir);  // explicit dir
   bool strings_loaded() const { return json_max_id_ != 0; }
+  // Walk up from in_dir (8 levels) for the game's <root>/local/lng/strings
+  // directory.  Exposed so the decompiler can carry the localisation with its
+  // output -- the generated txt references string Keys, not raw ids.
+  static bool FindStringsDir(const std::string& in_dir, std::string& out_dir);
 
   // Reverse map (id -> Key) for the decompiler's STRCALL inversion.  Built
   // alongside the forward map; first id occurrence wins.
