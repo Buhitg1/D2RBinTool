@@ -1823,17 +1823,22 @@ bool MergeFile(const std::string& path, const std::vector<std::string>& header,
     lines[r + 1] += JoinCells(rows[r]);
   }
   std::string out;
-  for (const auto& l : lines) { out += l; out += '\n'; }
+  for (const auto& l : lines) { out += l; out += "\r\n"; }  // CRLF: see BuildFileContent
   return Decomp::WriteFile(path, out);
 }
 
 std::string BuildFileContent(const std::vector<std::string>& header,
                              const std::vector<std::vector<std::string>>& rows) {
+  // Every shipped .txt (Blizzard's 85 in data_69270, the mod's 13) uses CRLF.
+  // The engine's txt reader (sub_1419D8500) scans IN-PLACE turning TAB and CR
+  // into NUL and ending the line on LF, and it asserts that the byte after a CR
+  // is LF -- i.e. it expects CRLF pairs.  A bare-LF file therefore does not
+  // have the shape the reader walks, so write CRLF like every real .txt.
   std::string out = JoinCells(header);
-  out += '\n';
+  out += "\r\n";
   for (const auto& row : rows) {
     out += JoinCells(row);
-    out += '\n';
+    out += "\r\n";
   }
   return out;
 }

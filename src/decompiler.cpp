@@ -1720,17 +1720,18 @@ bool MergeFile(const std::string& path, const std::vector<std::string>& header,
     lines[r + 1] += JoinCells(rows[r]);
   }
   std::string out;
-  for (const auto& l : lines) { out += l; out += '\n'; }
+  for (const auto& l : lines) { out += l; out += "\r\n"; }  // CRLF: see BuildFileContent
   return Decomp::WriteFile(path, out);
 }
 
 std::string BuildFileContent(const std::vector<std::string>& header,
                              const std::vector<std::vector<std::string>>& rows) {
+  // Every shipped .txt uses CRLF.
   std::string out = JoinCells(header);
-  out += '\n';
+  out += "\r\n";
   for (const auto& row : rows) {
     out += JoinCells(row);
-    out += '\n';
+    out += "\r\n";
   }
   return out;
 }
